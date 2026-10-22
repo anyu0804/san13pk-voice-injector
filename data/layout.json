@@ -1,0 +1,9 @@
+{
+  "name": "san13pk-tc-observed-layout",
+  "note": "繁体中文 PK 数据包的一组已观察布局；不代表全部版本兼容。其他版本须自行核实这些偏移。",
+  "table_base": "0x894B8600",
+  "slot_count": 4015,
+  "officer_base": "0x60C1",
+  "officer_stride": 432,
+  "officer_count": 855
+}

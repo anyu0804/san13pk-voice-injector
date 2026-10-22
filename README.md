@@ -1,123 +1,124 @@
 # san13pk-voice-injector
 
-三国志13 威力加强版（San13PK）**历史武将专属语音库整体替换工具**：把一个 9 段制式语音包（01_初次拜访 ～ 09_生死羁绊，另可带 10/11 扩展段）自动分配、裁切、编码、封装，整体注入某个历史武将的专属语音库槽位，实现该武将**全场景换声线**。
+三国志13威力加强版（San13PK）历史武将语音库替换工具。把 9 段制式语音包
+（可带 10/11 扩展段）经过 ASR 定位、语义分桶、时长约束裁切和 KOVS 封装，
+生成专属语音库的替换载荷。版本 **0.2.0，实验性工具**。
 
-核心特性：ASR 自动定位槽区 → 语义分桶 + 时长约束分配 → KOVS 封装 → 四道安全门禁 → 一键回滚。基准案例：袁绍，97/97 槽注入并实机验收通过（2026-10-05）。
+合成文件回归测试不代表任何游戏版本的实机验收。历史袁绍 97 槽案例是项目
+历史记录，当前安装仍须重新定位、确认和验收。
 
-> **Windows 专用**（写包门禁依赖 `tasklist` 检查游戏进程、ffmpeg 按 `.exe` 解析）。
+## 适用范围与安装
 
-## ⚠️ 免责声明
+- Windows、Python 3.10+，`pip install -r requirements.txt`。
+- ffmpeg/ffprobe 放入 PATH，或设置 `VJ_FFMPEG_DIR`，或放在仓库 `bin/` 下。
+- faster-whisper 首次运行会下载 small 模型；推理在本地进行，不调用在线语音 API。
+  顶层依赖固定为 [1.2.1](https://pypi.org/project/faster-whisper/1.2.1/)，传递依赖尚未全量锁定。
+- 默认布局仅对应曾观察的繁体中文 PK 数据包，不宣称其他语言、补丁或 MOD 通用。
+  `data/layout.json` 保存帧表、槽数和共享剧本表布局；移植必须独立核实这些参数。
+- 自行从持有的游戏导出共享剧本副本，放到 `SAN13PK_EXPORT` 指向的位置。
+  未提供时不能通过独占性校验；仓库不提供游戏数据导出副本。
 
-- 本工具仅用于修改**使用者本人合法持有**的游戏副本，供单机个人使用；请勿分发修改后的游戏文件。
-- 本仓库**不包含任何游戏资产**：无游戏数据文件、无抽取音频、无语音包素材、无转写缓存。
-- 写包前**务必备份 `pk\DATA1.S13`**（工具会在运行目录再做逐槽原文备份，但全局备份是你自己的责任）。
-- 使用本工具造成的任何后果由使用者自行承担。
-
-## 原理一图流
-
-```
-语音包(9~11 段 WAV)
-   │  whisper small 词级 ASR（断句 + 时间戳）
-   ▼
-plan ── 槽位台词(全表 ASR 缓存) × 场景分桶规则(buckets.json) × 物理间隙容量约束
-   │        → 每槽分配 [源文件, t0, t1] 裁切计划（人工核对）
-   ▼
-build ── ffmpeg 裁切重编码(24k mono vorbis ABR16k + loudnorm) → KOVS 32B 头 + 索引 XOR 封装
-   ▼
-write ── 四道门禁全 PASS 后写入 pk\DATA1.S13，逐槽读回验证
-   ▼
-实机验收 ── 不满意可 rollback 逐槽还原
-```
-
-格式细节（KOVS 头、索引 XOR、帧表布局、段界短应答簇）见 [docs/format.md](docs/format.md)。
-
-## 环境要求
-
-- Windows，Python 3.10+
-- `pip install -r requirements.txt`（faster-whisper；首次定位会自动下载 whisper base/small 模型）
-- ffmpeg / ffprobe：三选一 —— ① 加入 PATH；② 设 `VJ_FFMPEG_DIR` 指向其目录；③ 放一份到仓库 `bin/` 下（`.gitignore` 已忽略）
-- 一份 San13PK 游戏安装（`pk\DATA1.S13`）
-- **共享剧本导出副本**（门禁 1 依赖）：855 武将记录 × 每条 0x1B0 字节的数据块导出（武将号字节在记录内偏移 -8、相对基准 0x60C1），可用剧本编辑器或十六进制工具从你自己的游戏数据导出。放到 `SAN13PK_EXPORT` 指向的路径（默认 `<SAN13PK_HOME>\outputs\voice-bank\shared-scenario-export.s13`）。**没有它门禁 1 无法字节级复验，禁止写包。**
-
-## 环境变量
-
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `SAN13PK_HOME` | `D:\San13PK` | 游戏根目录（其下应有 `pk\DATA1.S13`） |
-| `SAN13PK_EXPORT` | `<HOME>\outputs\voice-bank\shared-scenario-export.s13` | 共享剧本导出副本路径 |
-| `SAN13PK_ASR_HOME` | `<HOME>\outputs\asr` | ASR 模型与可选 deps 目录 |
-| `SAN13PK_OUT` | `<HOME>\outputs\inject` | 运行目录（plan/kovs/备份/manifest） |
-| `VJ_FFMPEG_DIR` | （PATH） | ffmpeg.exe / ffprobe.exe 所在目录 |
-| `VJ_PACKS_DIR` | `~/Downloads` | `list` 命令扫描语音包的目录 |
-| `VJ_CPU_THREADS` | （自动） | faster-whisper CPU 线程数 |
+| 环境变量 | 默认值 / 作用 |
+| --- | --- |
+| `SAN13PK_HOME` | `D:\San13PK`，游戏根目录，只替换其 `pk\DATA1.S13` |
+| `SAN13PK_EXPORT` | `<HOME>/outputs/voice-bank/shared-scenario-export.s13` |
+| `SAN13PK_LAYOUT` | 仓库 `data/layout.json`；其他布局需自行验证 |
+| `SAN13PK_ASR_HOME` | `<HOME>/outputs/asr`，模型及可选 deps |
+| `SAN13PK_OUT` | `<HOME>/outputs/inject`，计划、载荷、原文备份、操作记录 |
+| `SAN13PK_PROCESS_NAMES` | 额外游戏 exe 名，逗号分隔；用于改名的可执行文件 |
+| `VJ_FFMPEG_DIR` | ffmpeg.exe/ffprobe.exe 所在目录 |
+| `VJ_PACKS_DIR` | `~/Downloads`，仅供 `list` 本地查找语音包，不下载素材 |
+| `VJ_CPU_THREADS` | faster-whisper CPU 线程数 |
 
 ## 使用流程
 
+先完整备份游戏数据包，并在独立副本上操作。关闭游戏，留出至少一个完整
+`pk/DATA1.S13` 副本大小的同盘空闲空间；空间不足会报错并保留正式文件。
+
 ```bash
 cd scripts
-
-# ① 首次：全表 4015 槽 ASR 扫描（base→small，约 2~4 小时，可中断续跑，可分段并行）
-python scan_all.py            # 或 python scan_all.py 0 2000 分片
-
-# ② 列出可让渡武将 / 语音包 / 定位状态
+python voice_inject.py --version
 python voice_inject.py list
-
-# ③ 定位某武将专属语音库槽区（自称锚字扫描 + 边界复核）
-python voice_inject.py locate 张角
-
-# ④ 生成分桶裁切计划（plan.json 给人看）
-python voice_inject.py plan <语音包目录> 张角
-
-# ⑤ 人工核对 plan（见下）→ 编码打包（不写包）+ 备份原文
-python voice_inject.py build <运行目录> 张角
-
-# ⑥ 四道门禁 + 写入 + 全验证
-python voice_inject.py write <运行目录> 张角
-
-# ⑦ 出问题逐槽还原
-python voice_inject.py rollback 张角 <运行目录>
+python scan_all.py                  # small 模型全表扫描，可指定 start/end
+python voice_inject.py locate 孙策  # 仅生成候选，verified=false
 ```
 
-## 安全边界（违反即可能毁档/误伤）
+人工核对候选两侧、首尾和短应答簇后，以实际安装的槽号运行：
 
-1. **只允许注入 `data/officers.json` 白名单里已验证独占专属语音库的武将**。通用声线武将（Voice 0–13）绝不可用——会误伤全体大众脸 NPC。
-2. 只写 `pk\DATA1.S13`；根目录 `DATA1.S13` 一律不碰；**帧表（0x894B8600）永不改动**。
-3. 写包前游戏必须完全退出（门禁 3b 自检）。
-4. **plan 结果必须人工核对并确认后才允许 build/write**——本工具刻意保留人在回路，不要跳过。
+```text
+python voice_inject.py confirm-bank 孙策 --battle <战斗起点> <战斗终点> --dialogue <对话起点> <对话终点>
+python voice_inject.py plan <语音包目录> 孙策
+```
 
-## 四道门禁
+`data/bank-map.json` 的孙策/袁绍区间是历史参考，不能直接当作当前安装的确认。
+`locate` 每个区域至少需要两处自称锚点，但启发式、繁简转换和名单仍不能证明
+槽区独占；只有人工确认后才绑定当前帧表和音频指纹。张角属于 `partial`，
+缺少已确认的独占对话库且战斗槽交织，禁止完整库定位/注入。
 
-| # | 名称 | 内容 |
-| --- | --- | --- |
-| 1 | 独占性 | 目标 Voice 库在 855 武将表中引用数 = 1（对共享剧本导出副本字节级复验）+ 槽区无同偏移别名 |
-| 2 | 定位 | bank-map verified：自称锚字在战斗/对话区各 ≥1 命中，边界外侧为他库/系统行 |
-| 3 | 容量与基底 | 每槽 KOVS ≤ 物理间隙；游戏未运行；写前断言当前字节 == 备份原文 |
-| 4 | 写后验证 | 逐槽读回哈希 + 文件内解码 + 4MB 块哈希受限差异 + 帧表未动 + 文件大小不变 |
+查看生成目录的 `plan.json`：核对武将、源文件、每个裁切区间、所有槽号，特别
+是左右边界的短应答是否属于本武将。ASR 会误识别，自动分桶也会出现语义错位。
+修改计划后，再明确确认并构建：
 
-任一 FAIL 立即中止，不落盘。
+```text
+python voice_inject.py approve <运行目录> 孙策
+python voice_inject.py build <运行目录> 孙策
+python voice_inject.py write <运行目录> 孙策
+python voice_inject.py status <运行目录> 孙策
+python voice_inject.py rollback 孙策 <运行目录>
+```
 
-## plan 后人工核对点（必做）
+`approve` 是使用者已审阅的明确声明，不替使用者判断台词归属。确认后修改计划
+需要重新 approve/build。打错运行目录直接报错，不会自动选择“最新一次”。
+旧版计划/manifest 不兼容，须重新确认槽区并 plan/approve/build；不自动迁移备份。
 
-1. plan.json 里 battle/dialogue **首尾各 2 槽**的 `orig_text` 是否确为目标武将台词（自报名/称号）；
-2. **★ 段界短应答簇**：名将段结构是 `[前一位武将主台词 …] [本武将短应答簇 1~4 槽] [本武将主台词 …]`。静态边界只圈到主台词，**簇会被漏在范围外**，游戏读到这些槽时播的是前一位武将的原声（症状：该武将个别台词"还是原来的声音"，但字段/库/哈希全部正常）。查法：看计划**左界前 1~4 槽**的 `data/asr-cache/slotN.txt`，若是命令短应答（我知道了/交给我吧/明白…）则属本武将，应纳入计划；右界同理查 1~2 槽。判归属：看前一位武将在自己段内是否另有同套应答。详见 [docs/format.md](docs/format.md)；
-3. 抽查 `cut_text` 分配有无明显荒谬（如笑槽分到长独白）——离谱的改 plan.json 对应行的 `scene_file/t0/t1` 再 build；
-4. 语义错位是自动分配的正常代价，实听后可点名槽位微调。
+## 写入与回滚的实际边界
 
-## 已知坑（前人踩过，勿重复）
+1. 写入时重新检查武将身份、共享剧本表中的 Voice 独占性、确认槽区、计划指纹、
+   逻辑槽号到物理偏移的映射、别名、载荷/备份和完整基底指纹。
+   全部预检通过前，不写任何游戏槽位。
+2. 在正式包所在目录建立临时完整副本，向副本写入；核对精确大小、完整帧表和
+   每个字节的预期变化，再从副本读回 KOVS，用 ffmpeg 严格解码。
+3. 再查游戏进程和正式包基底；全部通过后用同盘 `os.replace` 替换正式文件。
+   候选写入或验证失败不需要恢复正式包，因为正式包尚未修改。
+4. `write-state.json` 记录替换前和候选指纹。中断后用 `status` 区分“未替换”、
+   “已完整替换但完成记录未更新”和“外部修改”；确认已注入后可执行 rollback。
+   这不是断电、磁盘损坏或所有文件系统场景的持久性保证，完整外部备份仍需保留。
+5. 回滚检查游戏退出、目标身份、帧表、备份和全部当前槽位。若同槽有其他 MOD
+   后续修改，拒绝覆盖，且不会先恢复部分槽。回滚也在副本上读回验证后替换。
 
-- **语音流必须做"索引 XOR"封装，漏了 = 静音**（字段/哈希全正常，就是没声）。见 format.md。
-- San13Pictool 的导入功能会写坏 KOVS 头（流长=0），**禁用**其导入，用本工具。
-- ffmpeg 直接写文件可能被杀软拦截——本工具一律走 stdout 管道，请勿改回。
-- ASR 定位**必须用 small 模型**文本：base 会把人名听错（孔明→孫明）。
+进程检测匹配 San13/San13PK 及语言后缀，不使用内存阈值；查询失败或输出异常
+时拒绝写入。被任意改名的游戏需配置 `SAN13PK_PROCESS_NAMES`，不靠猜测识别。
+ASR 缓存绑定槽位音频或单个 WAV 内容及 small 模型名称；更换包或音频会失效，
+旧版未绑定内容的缓存不再使用。源音频变化后须重新生成裁切计划。
 
-## 与现有工具的关系
+## 格式来源与已有工具
 
-2016–2017 年社区已有**闭源 GUI 工具**（San13Pictool v1.7、威力加强版资源修改工具等）支持人物语音的手工导出/导入。本项目的差异在于：
+KOVS 头及前 0x100 字节索引 XOR 是已有公开格式知识。致谢
+[vgmstream 的 KOVS 实现](https://github.com/vgmstream/vgmstream/blob/master/src/meta/ogg_vorbis.c)，
+其中 `kovs_ogg_decryption_callback` 实现了该异或规则；本项目不宣称它是原创发现。
+San13Pictool 等社区工具已有手工导出/导入路径；本项目侧重 ASR、语义分配、
+容量约束和可检查的替换流程。未附版本及可复现样本的第三方缺陷断言已移除。
+格式与适用布局见 [docs/format.md](docs/format.md)。
 
-- **全自动分配**：从 9 段制式语音包出发，ASR 自动定位目标武将槽区、按台词语义分桶、按时长约束裁切——无需"导出 → 手工对齐重命名 → 导回"的人工流程；
-- **安全工程**：独占性字节级复验、容量/基底/写后四道门禁、逐槽备份与一键回滚（San13Pictool 的导入会写坏 KOVS 头、流长=0，本项目封装正确并修复该问题）；
-- **开源可审计**，并附格式文档（[docs/format.md](docs/format.md)）。
+## 语音包与使用责任
 
-## License
+- 仅用于本人合法持有的游戏副本；不分发游戏包、抽取音频、语音素材或转写缓存。
+- 素材须为自录、已获必要授权，或不模仿可识别真人且具有合法使用权的合成声音。
+  使用者自行核对配音、录音和其他授权；仓库不链接第三方语音包。
+- 不得用于冒充、骚扰或未经同意的性化内容。
+- “单机 MOD”“极短片段”和工具许可证均不代表取得他人声音、素材的使用许可。
+- 三国志13及相关商标归光荣特库摩；本项目与官方无关联。
 
-MIT。仓库不含任何游戏资产；三国志13 及相关商标归属光荣特库摩（コーエーテクモゲームス），本项目与官方无关联。
+## 开发验证
+
+Python 3.11+ 和 ffmpeg 可运行：
+
+```bash
+python -m compileall -q scripts tests
+python -m unittest discover -s tests -v
+```
+
+测试只用临时合成包和内存夹具，不读取本机游戏文件，不下载 ASR 模型。
+大部分业务测试替换 ASR/进程/编解码调用，另有真实 ffmpeg 合成音频编解码测试。
+GitHub Actions 配置运行同一套测试，远端结果以实际运行记录为准。
+版本变更见 [CHANGELOG.md](CHANGELOG.md)。许可证为原有 [MIT](LICENSE)。

@@ -4,8 +4,8 @@
   list                         列出可用武将/语音包/bank 定位状态
   locate  <武将>               ASR 扫描定位该武将专属语音库槽区（缓存）
   plan    <语音包目录> <武将>  槽位分桶 + 包内词级ASR + 裁切分配 → plan.json + 报告
-  build   <语音包目录> <武将>  按 plan 编码打包 KOVS、备份原文、门禁1-3（不写包）
-  write   <语音包目录> <武将>  门禁3b/3c + 写入 + 门禁4 全验证
+  build   <运行目录> <武将>  按 plan 编码打包 KOVS、备份原文、门禁1-3（不写包）
+  write   <运行目录> <武将>  门禁3b/3c + 写入 + 门禁4 全验证
   rollback <武将> <运行目录>   从 originals 逐槽还原
 
 四道门禁（全部 PASS 才落盘/才算成功）：
@@ -18,30 +18,43 @@
       ffmpeg 经 stdout 管道写盘（AV 拦截旁路）；KOVS 头 size@4=流长、flag@0x10=1。
 """
 
+import argparse
+import bisect
+import csv
 import hashlib
+import io
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 # ---- 路径配置（全部可用环境变量覆盖，见 README“环境变量”一节）----
-SKILL = Path(__file__).resolve().parent.parent
-DATA = SKILL / "data"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA = PROJECT_ROOT / "data"
 ROOT = Path(os.environ.get("SAN13PK_HOME", r"D:\San13PK"))
 PK = ROOT / "pk" / "DATA1.S13"
 EXPORT = Path(os.environ.get(
     "SAN13PK_EXPORT",
     str(ROOT / "outputs" / "voice-bank" / "shared-scenario-export.s13")))
-BASE = 0x894B8600
+LAYOUT = json.loads(Path(os.environ.get("SAN13PK_LAYOUT", str(DATA / "layout.json"))).read_text(encoding="utf-8"))
+BASE = int(LAYOUT["table_base"], 0)
+SLOT_COUNT = LAYOUT["slot_count"]
+OFFICER_BASE = int(LAYOUT["officer_base"], 0)
+OFFICER_STRIDE = LAYOUT["officer_stride"]
+OFFICER_COUNT = LAYOUT["officer_count"]
+if BASE < 0 or SLOT_COUNT < 1 or OFFICER_BASE < 8 or OFFICER_STRIDE < 1 or OFFICER_COUNT < 1:
+    raise ValueError("布局配置的偏移或记录数量无效")
 _ff_env = os.environ.get("VJ_FFMPEG_DIR")
 if _ff_env and (Path(_ff_env) / "ffmpeg.exe").exists():
     FFDIR = Path(_ff_env)
-elif (SKILL / "bin" / "ffmpeg.exe").exists():
-    FFDIR = SKILL / "bin"
+elif (PROJECT_ROOT / "bin" / "ffmpeg.exe").exists():
+    FFDIR = PROJECT_ROOT / "bin"
 else:
     FFDIR = None  # 回退到 PATH 中的 ffmpeg / ffprobe
 FF = str(FFDIR / "ffmpeg.exe") if FFDIR else "ffmpeg"
@@ -62,7 +75,7 @@ SYSTEM_PHRASES = ["击败敌将", "敌将逼近", "大本营", "阵营被敌军"
                   "口信", "他国的使者", "有人通敌", "辞官", "我收到了", "有客人来了",
                   "俘虏敌将", "战胜了", "败走了",
                   "擊敗敵將", "俘虜敵將", "戰勝了", "敗走了"]
-SYSTEM_EXACT = {"报告", "明白", "是", "罪", "罪名", "出发"}
+SYSTEM_EXACT = {"报告", "罪", "罪名"}
 REGION_BATTLE = [(1500, 1800), (1800, 2060), (840, 1500)]
 REGION_DIALOG = [(3700, 4015), (2060, 3700)]
 STRIDE = 3
@@ -82,20 +95,28 @@ def die(msg):
 
 # ---------- 游戏帧表 ----------
 
-def load_table():
-    with PK.open("rb") as f:
+def table_bytes(path):
+    with path.open("rb") as f:
         f.seek(BASE)
-        raw = f.read(4015 * 8)
-    if struct.unpack_from("<I", raw, 0)[0] != 4015:
-        die("帧表头校验失败（count!=4015）——现役包可能被改动，禁止继续")
-    offs = [struct.unpack_from("<I", raw, i * 8 + 4)[0] + BASE for i in range(4015)]
-    return offs
+        raw = f.read(SLOT_COUNT * 8)
+    if len(raw) != SLOT_COUNT * 8 or struct.unpack_from("<I", raw, 0)[0] != SLOT_COUNT:
+        die("帧表长度或计数与布局配置不符")
+    return raw
 
 
-def slot_info(offs_sorted, slot):
-    ao = offs_sorted[slot]
-    i = offs_sorted.index(ao)
-    gap = (offs_sorted[i + 1] - ao) if i + 1 < len(offs_sorted) else None
+def load_table():
+    raw = table_bytes(PK)
+    return [struct.unpack_from("<I", raw, i * 8 + 4)[0] + BASE for i in range(SLOT_COUNT)]
+
+
+def slot_info(offs, slot):
+    ao = offs[slot]  # 槽号只能索引原始帧表，不能索引物理地址排序表。
+    physical = sorted(set(offs))
+    i = bisect.bisect_right(physical, ao)
+    end = physical[i] if i < len(physical) else PK.stat().st_size
+    gap = end - ao
+    if ao < BASE + SLOT_COUNT * 8 or gap < 32 or end > PK.stat().st_size:
+        die(f"slot {slot} 地址或物理间隙超出文件边界")
     with PK.open("rb") as f:
         f.seek(ao)
         hdr = f.read(32)
@@ -105,23 +126,18 @@ def slot_info(offs_sorted, slot):
 
 
 def extract_ogg(slot):
-    """只读抽取 slot 的 ogg 流（内存中），带缓存。"""
-    cache = DATA / "asr-cache" / f"slot{slot}.ogg"
-    if cache.exists():
-        return cache.read_bytes()
+    """从当前文件抽取槽位；不复用未绑定内容的旧 ogg 缓存。"""
     offs = load_table()
+    ao, decl, gap = slot_info(offs, slot)
+    if decl > gap - 32:
+        die(f"slot {slot} 声明流长超出槽位容量")
     with PK.open("rb") as f:
-        f.seek(offs[slot])
-        hdr = f.read(32)
-        decl = struct.unpack_from("<I", hdr, 4)[0]
-        blob = hdr + f.read(decl)
-    stream = bytearray(blob[32:32 + decl])
+        f.seek(ao + 32)
+        stream = bytearray(f.read(decl))
     for i in range(min(0x100, len(stream))):
         stream[i] ^= i
     if stream[:4] != b"OggS":
         die(f"slot {slot} 解码后非 OggS")
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_bytes(bytes(stream))
     return bytes(stream)
 
 
@@ -158,11 +174,13 @@ def _decode_pcm(path):
 
 def asr_slot_text(slot):
     """槽位文本（small 模型——base 会把人名念错：孔明→孫明、袁绍→原本初）。缓存。"""
-    cache = DATA / "asr-cache" / f"slot{slot}.txt"
+    ogg = extract_ogg(slot)
+    fingerprint = hashlib.sha256(ogg).hexdigest()
+    cache = DATA / "asr-cache" / f"slot{slot}-{fingerprint}-small.txt"
     if cache.exists():
         return cache.read_text(encoding="utf-8")
     m = _model("small")
-    segs, _ = m.transcribe(_decode_pcm_bytes(extract_ogg(slot)), language="zh",
+    segs, _ = m.transcribe(_decode_pcm_bytes(ogg), language="zh",
                            beam_size=5, vad_filter=False, condition_on_previous_text=False,
                            temperature=0.0)
     text = "".join(s.text for s in segs).strip()
@@ -184,26 +202,19 @@ def _decode_pcm_bytes(ogg):
 
 def asr_pack_words(pack_dir):
     """包内词级转写（缓存 per 包名）。返回 {scene_no: {duration,text,sentences,words}}。"""
-    key = re.sub(r"[^\w\u4e00-\u9fff]+", "_", pack_dir.name)
-    cache = DATA / "asr-cache" / f"pack-{key}-words.json"
-    existing = {}
-    if cache.exists():
-        existing = {int(k): v for k, v in json.loads(cache.read_text(encoding="utf-8")).items()}
-
     needed_files = {k: v for k, v in SCENE_FILES.items() if (pack_dir / v).exists()}
     for no in range(1, 10):
         if no not in needed_files:
             die(f"语音包缺基础文件: {pack_dir / SCENE_FILES[no]}")
 
-    if all(no in existing for no in needed_files):
-        return {no: existing[no] for no in needed_files}
-
-    m = _model("small")
-    out = dict(existing)
+    out = {}
     for no, fname in needed_files.items():
-        if no in out:
-            continue
         wav = pack_dir / fname
+        cache = DATA / "asr-cache" / f"pack-{no}-{file_hash(wav)}-small-words.json"
+        if cache.exists():
+            out[no] = json.loads(cache.read_text(encoding="utf-8"))
+            continue
+        m = _model("small")
         segs, info = m.transcribe(_decode_pcm(wav), language="zh", beam_size=5,
                                   vad_filter=False, condition_on_previous_text=False,
                                   temperature=0.0, word_timestamps=True)
@@ -216,8 +227,8 @@ def asr_pack_words(pack_dir):
                                   "text": s.text.strip()} for s in seg_list],
                    "words": words}
         log(f"  pack ASR {fname}: {out[no]['text'][:30]}")
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(out[no], ensure_ascii=False, indent=1), encoding="utf-8")
     return out
 
 
@@ -232,11 +243,11 @@ def voice_gate(name):
     """门禁1：导出表验证 voice 值与独占性。"""
     o = officers().get(name) or die(f"未知武将 {name}（见 officers.json）")
     d = EXPORT.read_bytes()
-    Q0 = 0x60C1
-    S = 0x1B0
-    if len(d) < Q0 + 855 * S:
+    Q0 = OFFICER_BASE
+    S = OFFICER_STRIDE
+    if len(d) < Q0 + OFFICER_COUNT * S:
         die("共享剧本导出文件缺失或尺寸异常")
-    voices = [d[Q0 + i * S - 8] for i in range(855)]
+    voices = [d[Q0 + i * S - 8] for i in range(OFFICER_COUNT)]
     v = voices[o["id"]]
     users = [i for i, x in enumerate(voices) if x == v]
     if v != o["voice"] or users != [o["id"]]:
@@ -256,26 +267,35 @@ def save_bankmap(m):
 
 # ---------- locate ----------
 
+TRADITIONAL = str.maketrans({"趙": "赵", "雲": "云", "呂": "吕", "諸": "诸", "劉": "刘", "備": "备",
+                           "張": "张", "飛": "飞", "關": "关", "孫": "孙", "權": "权", "龐": "庞",
+                           "統": "统", "韋": "韦", "堅": "坚", "會": "会", "賈": "贾", "詡": "诩",
+                           "擊": "击", "敗": "败", "敵": "敌", "將": "将", "虜": "虏", "報": "报",
+                           "陣": "阵", "營": "营", "軍": "军", "國": "国", "辭": "辞", "傳": "传",
+                           "馬": "马", "黃": "黄", "維": "维", "貂": "貂", "蟬": "蝉", "遼": "辽"})
+
+
 def _is_marker(text, markers):
-    return any(mk in text for mk in markers)
+    text = text.translate(TRADITIONAL)
+    return any(mk.translate(TRADITIONAL) in text for mk in markers)
 
 
-def _is_foreign(text):
-    if text in SYSTEM_EXACT or len(text) <= 2 and text in SYSTEM_EXACT:
-        return True
-    return any(p in text for p in SYSTEM_PHRASES) or any(n in text for n in OTHER_NAMES)
+def _is_foreign(text, markers):
+    text = text.translate(TRADITIONAL)
+    if _is_marker(text, markers):
+        return False
+    names = OTHER_NAMES + [mk for o in officers().values() for mk in o["markers"]]
+    return (text in SYSTEM_EXACT or any(p.translate(TRADITIONAL) in text for p in SYSTEM_PHRASES)
+            or any(n.translate(TRADITIONAL) in text for n in names))
 
 
 def _scan(region_list, markers, label):
     hits = {}
-    import bisect
-    offs = load_table()
-    sorted_offs = sorted(offs)
     for lo, hi in region_list:
         probes = list(range(lo, hi, STRIDE))
         log(f"  {label} 扫描 {lo}..{hi} 共 {len(probes)} 探针（stride {STRIDE}）")
         for s in probes:
-            if s >= 4015:
+            if s >= SLOT_COUNT:
                 break
             t = asr_slot_text(s)
             if _is_marker(t, markers):
@@ -287,56 +307,95 @@ def _scan(region_list, markers, label):
 def _refine(start_hint, end_hint, markers, cap):
     """从锚点簇向外扩展到边界（遇他库/系统/占位停）。"""
     lo, hi = start_hint, end_hint
-    while hi - end_hint < cap and hi + 1 < 4015:
+    while hi - end_hint < cap and hi + 1 < SLOT_COUNT:
         t = asr_slot_text(hi + 1)
-        if _is_foreign(t) or t == "":
+        if _is_foreign(t, markers) or t == "":
             break
-        if _is_marker(t, markers):
-            hi += 1
-        else:
-            hi += 1
+        hi += 1
     while start_hint - lo < cap and lo - 1 >= 0:
         t = asr_slot_text(lo - 1)
-        if _is_foreign(t) or t == "":
+        if _is_foreign(t, markers) or t == "":
             break
-        if _is_marker(t, markers):
-            lo -= 1
-        else:
-            lo -= 1
+        lo -= 1
     return lo, hi
 
 
 def cmd_locate(name):
-    o = voice_gate(name)
     m = bankmap()
-    if name in m and m[name].get("verified"):
+    if name in m and m[name].get("partial"):
+        die(f"{name} 为不完整或交织语音库，不能自动定位或注入")
+    o = voice_gate(name)
+    if name in m and m[name].get("verified") and m[name].get("source_sha256") == bank_fingerprint(m[name]):
         log(f"{name} 已定位: {m[name]}")
         return m[name]
     markers = o["markers"]
     bat = _scan(REGION_BATTLE, markers, "战斗区")
     dlg = _scan(REGION_DIALOG, markers, "对话区")
-    if not bat or not dlg:
+    if len(bat) < 2 or len(dlg) < 2:
         die(f"未在默认区域找到 {name} 的自称锚字（战斗 {len(bat)}/对话 {len(dlg)} 命中）。"
             f"扩大 REGION_* 或核对 markers 后重试")
     b_lo, b_hi = _refine(min(bat), max(bat), markers, 40)
     d_lo, d_hi = _refine(min(dlg), max(dlg), markers, 75)
     entry = {"battle": [b_lo, b_hi], "dialogue": [d_lo, d_hi], "voice": o["voice"],
-             "verified": True,
-             "evidence": f"战斗锚 {sorted(bat)}；对话锚 {sorted(dlg)}；"
-                         f"边界外核：{asr_slot_text(b_lo-1)[:12]} | {asr_slot_text(b_hi+1)[:12]}"
-                         f" / {asr_slot_text(d_lo-1)[:12]} | {asr_slot_text(d_hi+1)[:12]}",
+             "verified": False,
+             "evidence": f"候选战斗锚 {sorted(bat)}；候选对话锚 {sorted(dlg)}；边界归属待人工确认。",
              "located_at": time.strftime("%Y-%m-%d %H:%M")}
     m[name] = entry
     save_bankmap(m)
     log(f"定位完成：战斗 {b_lo}-{b_hi}（{b_hi-b_lo+1} 槽），对话 {d_lo}-{d_hi}（{d_hi-d_lo+1} 槽）")
-    log("⚠ plan 时请人工核对边界槽台词（首尾各 2 槽）再允许写包。")
+    log("候选不能直接写包；核对短应答簇与相邻武将后，运行 confirm-bank 明确确认两个区间。")
     return entry
+
+
+def bank_slots(entry):
+    if entry.get("partial") or entry["battle"] is None or entry["dialogue"] is None:
+        die("不完整或交织语音库不能注入")
+    slots = []
+    for key in ("battle", "dialogue"):
+        lo, hi = entry[key]
+        if not (0 <= lo <= hi < SLOT_COUNT):
+            die(f"{key} 槽区越界")
+        slots.extend(range(lo, hi + 1))
+    if len(slots) != len(set(slots)):
+        die("战斗/对话槽区重叠")
+    return slots
+
+
+def bank_fingerprint(entry):
+    digest = hashlib.sha256(table_bytes(PK))
+    offs = load_table()
+    slots = bank_slots(entry)
+    neighbors = {s + d for s in slots for d in (-1, 0, 1) if 0 <= s + d < SLOT_COUNT}
+    with PK.open("rb") as f:
+        for slot in sorted(neighbors):
+            ao, decl, gap = slot_info(offs, slot)
+            if decl > gap - 32:
+                die(f"slot {slot} 声明流长超出槽位容量")
+            f.seek(ao)
+            digest.update(struct.pack("<I", slot))
+            digest.update(f.read(32 + decl))
+    return digest.hexdigest()
+
+
+def cmd_confirm_bank(name, battle, dialogue):
+    m = bankmap()
+    if name in m and m[name].get("partial"):
+        die(f"{name} 的不完整语音库不能确认")
+    o = voice_gate(name)
+    entry = {"battle": list(battle), "dialogue": list(dialogue), "voice": o["voice"],
+             "verified": True, "evidence": "使用者已核对槽区、短应答簇及两侧归属。"}
+    entry["source_sha256"] = bank_fingerprint(entry)
+    m[name] = entry
+    save_bankmap(m)
+    log(f"已确认 {name} 的槽区（仅适用于当前帧表及音频内容）")
 
 
 # ---------- plan ----------
 
-def _bucket_of(text, buckets, where, has_ext=False):
+def _bucket_of(text, buckets, where, has_ext=False, markers=()):
     t = text.replace(" ", "")
+    if _is_marker(t, markers):
+        return "自报家门", 1
     if has_ext and "rules_ext" in buckets:
         g = buckets.get("grunt_ext", buckets["grunt"])
         if len(t) <= g["max_text_len"]:
@@ -408,7 +467,9 @@ def cmd_plan(pack_dir, name):
     if not entry.get("verified"):
         die(f"{name} bank 条目未验证")
     buckets = json.loads((DATA / "buckets.json").read_text(encoding="utf-8"))
-    offs_sorted = sorted(load_table())
+    if entry.get("source_sha256") != bank_fingerprint(entry):
+        die("槽区未绑定当前游戏数据，请重新核对并 confirm-bank")
+    offs = load_table()
     slots = (list(range(entry["battle"][0], entry["battle"][1] + 1)) +
              list(range(entry["dialogue"][0], entry["dialogue"][1] + 1)))
     # 门禁1b：槽区无同偏移别名
@@ -430,17 +491,19 @@ def cmd_plan(pack_dir, name):
     rows = []
     rot = {}
     for s in slots:
-        where = "battle" if s <= entry["battle"][1] else "dialogue"
+        where = "battle" if entry["battle"][0] <= s <= entry["battle"][1] else "dialogue"
         text = asr_slot_text(s)
-        bucket, fno = _bucket_of(text, buckets, where, has_ext=has_ext)
-        _, decl, gap = slot_info(offs_sorted, s)
-        cap = max(((gap or decl + 64) - 96) / BYTES_PER_SEC, MIN_CLIP_SEC)
+        bucket, fno = _bucket_of(text, buckets, where, has_ext=has_ext, markers=o["markers"])
+        _, decl, gap = slot_info(offs, s)
+        cap = max((gap - 96) / BYTES_PER_SEC, MIN_CLIP_SEC)
         spans = _sentence_spans(fno, words[fno]["words"], cap)
         if not spans:
             fb = buckets.get("fallback_ext", buckets["fallback"]) if has_ext else buckets["fallback"]
             alt = fb["battle" if where == "battle" else "dialogue"]
             spans = _sentence_spans(alt, words[alt]["words"], cap)
             fno = alt
+        if not spans:
+            die(f"slot {s} 没有符合容量的语音片段，请调整源素材")
         idx = rot.get(fno, 0) % len(spans)
         rot[fno] = idx + 1
         pick = spans[idx]
@@ -450,7 +513,10 @@ def cmd_plan(pack_dir, name):
                      "gap": gap, "decl": decl})
     (run / "plan.json").write_text(json.dumps(
         {"officer": name, "pack": str(pack), "voice": o["voice"],
-         "bank": entry, "slots": rows}, ensure_ascii=False, indent=1), encoding="utf-8")
+         "bank": entry, "approved": False,
+         "pack_sources": {str(no): file_hash(pack / fname) for no, fname in SCENE_FILES.items()
+                          if (pack / fname).exists()},
+         "slots": rows}, ensure_ascii=False, indent=1), encoding="utf-8")
     # 摘要
     from collections import Counter
     cb = Counter(r["bucket"] for r in rows)
@@ -476,9 +542,9 @@ def encode_clip(wav, t0, t1):
 
 
 def ogg_seconds(ogg):
-    p = subprocess.run([FF, "-v", "error", "-i", "pipe:0", "-f", "s16le", "-ar", "24000",
+    p = subprocess.run([FF, "-v", "error", "-xerror", "-err_detect", "explode", "-i", "pipe:0", "-f", "s16le", "-ar", "24000",
                         "-ac", "1", "-"], input=ogg, capture_output=True, timeout=60)
-    if p.returncode != 0:
+    if p.returncode != 0 or not p.stdout:
         die("解码回检失败")
     return len(p.stdout) / 2 / 24000
 
@@ -494,145 +560,264 @@ def wrap_kovs(ogg):
     return bytes(hdr) + bytes(stream)
 
 
-def _find_plan(run_or_latest, name):
-    run = Path(run_or_latest)
+def _find_plan(run_dir, name):
+    run = Path(run_dir)
     if not (run / "plan.json").exists():
-        cands = sorted(OUTROOT.glob(f"{name}-*/plan.json"))
-        if not cands:
-            die(f"找不到 plan（{run}）")
-        run = cands[-1].parent
-        log(f"使用最新 plan: {run}")
-    return run, json.loads((run / "plan.json").read_text(encoding="utf-8"))
+        die(f"找不到 plan（{run}），必须提供准确运行目录")
+    plan = json.loads((run / "plan.json").read_text(encoding="utf-8"))
+    if plan["officer"] != name or name not in officers():
+        die("plan 的武将与命令参数或白名单不符")
+    return run, plan
+
+
+def approval_hash(plan):
+    content = {k: v for k, v in plan.items() if k not in ("approved", "approval_sha256")}
+    return hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def cmd_approve(run_dir, name):
+    run, plan = _find_plan(run_dir, name)
+    plan["approved"] = True
+    plan["approval_sha256"] = approval_hash(plan)
+    (run / "plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding="utf-8")
+    log(f"已确认 {name} 的 {len(plan['slots'])} 槽计划；此后修改内容须重新 approve/build")
+
+
+def checked_plan(run_dir, name):
+    run, plan = _find_plan(run_dir, name)
+    if plan.get("approved") is not True or plan.get("approval_sha256") != approval_hash(plan):
+        die("计划尚未确认或确认后被修改；核对后运行 approve")
+    o = voice_gate(name)
+    entry = bankmap()[name]
+    if not entry.get("verified") or plan["bank"] != entry or plan["voice"] != o["voice"]:
+        die("计划的槽区或语音库与当前已确认配置不符")
+    slots = bank_slots(entry)
+    if [r["slot"] for r in plan["slots"]] != slots:
+        die("计划槽号与确认的槽区不一致")
+    if entry.get("source_sha256") != bank_fingerprint(entry):
+        die("槽区源内容已改变，请重新确认定位并生成计划")
+    offs = load_table()
+    if any(offs.count(offs[s]) != 1 for s in slots):
+        die("目标槽位存在同偏移别名")
+    return run, plan, offs
 
 
 def cmd_build(run_dir, name):
-    run, plan = _find_plan(run_dir, name)
+    run, plan, offs = checked_plan(run_dir, name)
     pack = Path(plan["pack"])
+    for no, fingerprint in plan["pack_sources"].items():
+        if file_hash(pack / SCENE_FILES[int(no)]) != fingerprint:
+            die("语音包在 plan 后已改变，请重新生成并确认计划")
+    base_sha256 = file_hash(PK)
     (run / "kovs").mkdir(exist_ok=True)
     (run / "originals").mkdir(exist_ok=True)
-    offs_sorted = sorted(load_table())
     out = []
     for r in plan["slots"]:
         wav = pack / SCENE_FILES[r["scene_file"]]
         ogg = encode_clip(wav, r["t0"], r["t1"])
         secs = ogg_seconds(ogg)
         kovs = wrap_kovs(ogg)
-        ao, decl, gap = slot_info(offs_sorted, r["slot"])
+        ao, decl, gap = slot_info(offs, r["slot"])
         if len(kovs) + 4 >= gap:
             die(f"门禁3 FAIL：slot {r['slot']} payload {len(kovs)} ≥ gap {gap}")
         pad_to = min(max(decl + 32, len(kovs) + 1), gap)
         payload = kovs + b"\x00" * (pad_to - len(kovs))
         bak = run / "originals" / f"slot{r['slot']}-orig.bin"
-        if not bak.exists():
-            with PK.open("rb") as f:
-                f.seek(ao)
-                bak.write_bytes(f.read(gap))
+        with PK.open("rb") as f:
+            f.seek(ao)
+            original = f.read(gap)
+        if bak.exists() and bak.read_bytes() != original:
+            die("原备份与当前文件冲突，请使用新的运行目录")
+        bak.write_bytes(original)
         (run / "kovs" / f"slot{r['slot']}.kovs").write_bytes(payload)
         out.append({"slot": r["slot"], "abs_off": f"0x{ao:X}", "pad_to": pad_to,
                     "kovs_bytes": len(kovs), "clip_sec": round(secs, 3), "gap": gap,
                     "payload_sha256": hashlib.sha256(payload).hexdigest(),
                     "orig_sha256": hashlib.sha256(bak.read_bytes()).hexdigest()})
         log(f"  slot {r['slot']} {secs:.2f}s {len(kovs)}B pad={pad_to} gap={gap} OK")
-    (run / "manifest.json").write_text(json.dumps(out, ensure_ascii=False, indent=1),
+    manifest = {"schema": 2, "officer": name, "plan_sha256": file_hash(run / "plan.json"),
+                "base_sha256": base_sha256, "base_size": PK.stat().st_size,
+                "table_sha256": hashlib.sha256(table_bytes(PK)).hexdigest(), "slots": out}
+    (run / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=1),
                                        encoding="utf-8")
     log(f"门禁3a PASS：{len(out)} 载荷全部 ≤ 间隙；原文已备份 {run/'originals'}")
 
 
 def _real_game_running():
-    out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq San13PK_tc.exe", "/FO", "CSV"],
-                         capture_output=True, text=True, encoding="gbk", errors="replace").stdout
-    for line in out.splitlines()[1:]:
-        parts = [p.strip('"') for p in line.split('","')]
-        if len(parts) >= 5 and parts[0] == "San13PK_tc.exe":
-            try:
-                if int(parts[4].replace(" K", "").replace(",", "")) > 100000:
-                    return int(parts[1])
-            except ValueError:
-                continue
+    result = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True,
+                            text=True, encoding="mbcs", errors="strict")
+    if result.returncode != 0:
+        die(f"无法查询游戏进程：{result.stderr}")
+    extra = {n.strip().casefold() for n in os.environ.get("SAN13PK_PROCESS_NAMES", "").split(",") if n.strip()}
+    rows = list(csv.reader(io.StringIO(result.stdout)))
+    if not rows or any(len(row) < 2 or not row[1].isdigit() for row in rows):
+        die("tasklist 返回格式异常，不能确认游戏已退出")
+    for row in rows:
+        if re.fullmatch(r"san13(?:pk)?(?:[_-].*)?\.exe", row[0], re.IGNORECASE) or row[0].casefold() in extra:
+            return int(row[1])
     return None
 
 
-def chunk_hashes(chunk=1 << 22):
-    h = []
-    with PK.open("rb") as f:
-        while True:
-            b = f.read(chunk)
-            if not b:
-                break
-            h.append(hashlib.sha256(b).hexdigest())
-    return h
+def require_game_stopped():
+    pid = _real_game_running()
+    if pid is not None:
+        die(f"游戏正在运行（PID {pid}），请完全退出后重试")
+
+
+def file_hash(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        while block := f.read(1 << 22):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def read_manifest(run, name, plan):
+    man = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    if man["schema"] != 2 or man["officer"] != name or man["plan_sha256"] != file_hash(run / "plan.json"):
+        die("manifest 版本、武将或计划指纹不符，请重新 build")
+    slots = [m["slot"] for m in man["slots"]]
+    if not slots or slots != [r["slot"] for r in plan["slots"]] or slots != bank_slots(plan["bank"]):
+        die("manifest 槽号与计划/槽区不符")
+    if man["base_size"] != PK.stat().st_size or man["table_sha256"] != hashlib.sha256(table_bytes(PK)).hexdigest():
+        die("游戏文件大小或完整帧表已改变")
+    offs = load_table()
+    rows = []
+    for m in man["slots"]:
+        s = m["slot"]
+        ao, _, gap = slot_info(offs, s)
+        if offs.count(ao) != 1 or ao != int(m["abs_off"], 16) or gap != m["gap"]:
+            die(f"slot {s} 的偏移、容量或唯一性已改变")
+        payload = (run / "kovs" / f"slot{s}.kovs").read_bytes()
+        original = (run / "originals" / f"slot{s}-orig.bin").read_bytes()
+        if (not 32 < len(payload) == m["pad_to"] <= gap or len(original) != gap
+                or hashlib.sha256(payload).hexdigest() != m["payload_sha256"]
+                or hashlib.sha256(original).hexdigest() != m["orig_sha256"]):
+            die(f"slot {s} 的载荷或原文备份损坏")
+        rows.append((ao, original, payload))
+    return man, rows
+
+
+def unwrap_kovs(payload):
+    if len(payload) < 32 or payload[:4] != b"KOVS":
+        die("载荷不是完整 KOVS")
+    decl = struct.unpack_from("<I", payload, 4)[0]
+    if decl < 4 or decl > len(payload) - 32:
+        die("KOVS 声明流长越界")
+    stream = bytearray(payload[32:32 + decl])
+    for i in range(min(0x100, len(stream))):
+        stream[i] ^= i
+    if stream[:4] != b"OggS":
+        die("KOVS 解封后不是 OggS")
+    return bytes(stream)
+
+
+def verify_candidate(stage, rows, decode):
+    if stage.stat().st_size != PK.stat().st_size or table_bytes(stage) != table_bytes(PK):
+        die("候选文件精确大小或完整帧表不符")
+    # 每个字节都与“原文件 + 明确目标范围”比较；同一 4MB 块内的越界变化也不能通过。
+    with PK.open("rb") as source, stage.open("rb") as candidate:
+        pos = 0
+        while block := source.read(1 << 22):
+            expected = bytearray(block)
+            for ao, before, after in rows:
+                lo, hi = max(pos, ao), min(pos + len(block), ao + len(after))
+                if lo < hi:
+                    expected[lo - pos:hi - pos] = after[lo - ao:hi - ao]
+            if candidate.read(len(block)) != expected:
+                die(f"候选文件存在非预期字节，块起点 {pos}")
+            pos += len(block)
+        if candidate.read(1):
+            die("候选文件尾部存在额外字节")
+    if decode:
+        with stage.open("rb") as f:
+            for ao, before, after in rows:
+                f.seek(ao)
+                ogg_seconds(unwrap_kovs(f.read(len(after))))
+
+
+def replace_ranges(run, rows, action, source_sha256):
+    # 同盘副本 + 原子替换：验证失败/进程中断发生在 replace 前时，正式文件从未写入。
+    fd, stage_name = tempfile.mkstemp(prefix=PK.name + ".voice-", suffix=".tmp", dir=PK.parent)
+    os.close(fd)
+    stage = Path(stage_name)
+    receipt = {"action": action, "state": "staging", "source_sha256": source_sha256,
+               "stage_name": stage.name}
+    state_path = run / "write-state.json"
+    state_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+    try:
+        shutil.copyfile(PK, stage)
+        with stage.open("r+b") as f:
+            for ao, before, after in rows:
+                f.seek(ao)
+                if f.read(len(before)) != before:
+                    die("候选基底与预检原文不符")
+                f.seek(ao)
+                f.write(after)
+            f.flush()
+            os.fsync(f.fileno())
+        verify_candidate(stage, rows, decode=(action == "write"))
+        receipt.update(state="ready", target_sha256=file_hash(stage))
+        state_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+        require_game_stopped()
+        if file_hash(PK) != source_sha256:
+            die("正式文件在候选制作期间被修改，已取消替换")
+        os.replace(stage, PK)
+        receipt["state"] = "committed"
+        state_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+    finally:
+        stage.unlink(missing_ok=True)
 
 
 def cmd_write(run_dir, name):
-    run, plan = _find_plan(run_dir, name)
-    man = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
-    pid = _real_game_running()
-    if pid:
-        die(f"门禁3b FAIL：游戏正在运行（PID {pid}），请完全退出后重试")
-    pre = chunk_hashes()
-    CH = 1 << 22
-    allow = set()
-    for m in man:
-        ao = int(m["abs_off"], 16)
-        allow.update({ao // CH, (ao + m["pad_to"]) // CH})
-    with PK.open("r+b") as f:
-        for m in man:
-            payload = (run / "kovs" / f"slot{m['slot']}.kovs").read_bytes()
-            if hashlib.sha256(payload).hexdigest() != m["payload_sha256"]:
-                die(f"载荷哈希不符 slot {m['slot']}")
-            ao = int(m["abs_off"], 16)
-            f.seek(ao)
-            cur = f.read(len(payload))
-            bak = (run / "originals" / f"slot{m['slot']}-orig.bin").read_bytes()[:len(payload)]
-            if cur != bak:
-                die(f"门禁3c FAIL：slot {m['slot']} 当前字节 != 备份原文（包被外部改动？）")
-            f.seek(ao)
-            f.write(payload)
-        f.flush()
-    post = chunk_hashes()
-    if len(pre) != len(post):
-        die("门禁4 FAIL：文件大小变化")
-    changed = [i for i, (a, b) in enumerate(zip(pre, post)) if a != b]
-    stray = [i for i in changed if i not in allow]
-    if stray:
-        die(f"门禁4 FAIL：越界变更块 {stray}")
-    for m in man:
-        ao = int(m["abs_off"], 16)
-        payload = (run / "kovs" / f"slot{m['slot']}.kovs").read_bytes()
-        with PK.open("rb") as f:
-            f.seek(ao)
-            if f.read(len(payload)) != payload:
-                die(f"门禁4 FAIL：读回不一致 slot {m['slot']}")
-            decl = struct.unpack_from("<I", payload, 4)[0]
-        stream = bytearray(payload[32:32 + decl])
-        for i in range(min(0x100, len(stream))):
-            stream[i] ^= i
-        if stream[:4] != b"OggS":
-            die(f"门禁4 FAIL：文件内解码异常 slot {m['slot']}")
+    require_game_stopped()
+    run, plan, _ = checked_plan(run_dir, name)
+    man, rows = read_manifest(run, name, plan)
+    if file_hash(PK) != man["base_sha256"]:
+        die("游戏文件已偏离 build 基底，请重新生成计划和构建")
+    changes = []
     with PK.open("rb") as f:
-        f.seek(BASE)
-        assert struct.unpack("<I", f.read(4))[0] == 4015
-    log(f"门禁4 PASS：{len(man)} 槽写入并验证；变更块 {len(changed)}/{len(allow)} 受限；帧表未动")
+        for ao, original, payload in rows:
+            f.seek(ao)
+            if f.read(len(original)) != original:
+                die(f"写前原文不符，偏移 {ao}；没有写入任何槽位")
+            ogg_seconds(unwrap_kovs(payload))
+            changes.append((ao, original[:len(payload)], payload))
+    replace_ranges(run, changes, "write", man["base_sha256"])
+    log(f"写入完成：{len(rows)} 槽，全部预检、候选读回/解码和范围验证通过后原子替换")
     log(f"回滚：python voice_inject.py rollback {name} {run}")
-    log("验收：冷启动游戏，目标武将全场景应为新声线；其他武将/系统通报必须原样。")
 
 
 def cmd_rollback(name, run_dir):
-    run = Path(run_dir)
-    man = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
-    offs = load_table()
-    with PK.open("r+b") as f:
-        for m in man:
-            ao = int(m["abs_off"], 16)
-            orig = (run / "originals" / f"slot{m['slot']}-orig.bin").read_bytes()
+    require_game_stopped()
+    run, plan = _find_plan(run_dir, name)
+    man, rows = read_manifest(run, name, plan)
+    source_sha256 = file_hash(PK)
+    changes = []
+    with PK.open("rb") as f:
+        for ao, original, payload in rows:
             f.seek(ao)
-            cur = f.read(len(orig))
-            if cur == orig:
+            current = f.read(len(original))
+            if current == original:
                 continue
-            f.seek(ao)
-            f.write(orig)
-        f.flush()
-    log(f"已按 originals 还原 {len(man)} 槽（幂等，已是原文的跳过）")
+            if current != payload + original[len(payload):]:
+                die(f"回滚冲突：偏移 {ao} 存在后续修改；没有恢复任何槽位")
+            changes.append((ao, payload, original[:len(payload)]))
+    if changes:
+        replace_ranges(run, changes, "rollback", source_sha256)
+    log(f"回滚完成：恢复 {len(changes)} 槽；已是原文的槽位跳过")
+
+
+def cmd_status(run_dir, name):
+    run, _ = _find_plan(run_dir, name)
+    state = json.loads((run / "write-state.json").read_text(encoding="utf-8"))
+    current = file_hash(PK)
+    if current == state.get("target_sha256"):
+        log(f"{state['action']} 已完整生效（即使完成记录在中断时未更新）")
+    elif current == state["source_sha256"]:
+        log("正式文件仍是操作前内容；可重新执行操作。临时文件如仍存在可手动清理：" + state["stage_name"])
+    else:
+        die("正式文件与操作前/候选指纹均不符，请保留现场检查，勿覆盖后续 MOD 修改")
 
 
 def cmd_list():
@@ -658,20 +843,41 @@ def cmd_list():
         print(f"  {p}")
 
 
-if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "list"
-    args = sys.argv[2:]
-    if cmd == "list":
+def main():
+    parser = argparse.ArgumentParser(description="San13PK 专属语音库替换工具（布局适用范围见 README）")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.2.0")
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("list", help="列出武将、定位状态和语音包")
+    locate = sub.add_parser("locate", help="ASR 生成待人工确认的候选槽区")
+    locate.add_argument("name")
+    confirm = sub.add_parser("confirm-bank", help="人工核对后明确确认两个闭区间")
+    confirm.add_argument("name")
+    confirm.add_argument("--battle", nargs=2, type=int, required=True)
+    confirm.add_argument("--dialogue", nargs=2, type=int, required=True)
+    plan = sub.add_parser("plan")
+    plan.add_argument("pack_dir")
+    plan.add_argument("name")
+    for command in ("approve", "build", "write", "status"):
+        cmd_parser = sub.add_parser(command)
+        cmd_parser.add_argument("run_dir")
+        cmd_parser.add_argument("name")
+    rollback = sub.add_parser("rollback")
+    rollback.add_argument("name")
+    rollback.add_argument("run_dir")
+    args = parser.parse_args()
+    if args.command in (None, "list"):
         cmd_list()
-    elif cmd == "locate":
-        cmd_locate(args[0])
-    elif cmd == "plan":
-        cmd_plan(args[0], args[1])
-    elif cmd == "build":
-        cmd_build(args[0], args[1])
-    elif cmd == "write":
-        cmd_write(args[0], args[1])
-    elif cmd == "rollback":
-        cmd_rollback(args[0], args[1])
+    elif args.command == "locate":
+        cmd_locate(args.name)
+    elif args.command == "confirm-bank":
+        cmd_confirm_bank(args.name, args.battle, args.dialogue)
+    elif args.command == "plan":
+        cmd_plan(args.pack_dir, args.name)
+    elif args.command == "rollback":
+        cmd_rollback(args.name, args.run_dir)
     else:
-        die(__doc__)
+        {"approve": cmd_approve, "build": cmd_build, "write": cmd_write, "status": cmd_status}[args.command](args.run_dir, args.name)
+
+
+if __name__ == "__main__":
+    main()

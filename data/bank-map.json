@@ -10,7 +10,7 @@
       4002
     ],
     "voice": 37,
-    "verified": true,
+    "verified": false,
     "evidence": "历史参考：战斗区 30 槽、对话区 67 槽；两侧为其他角色或系统音频。当前安装待确认。"
   },
   "张角": {
@@ -25,8 +25,8 @@
     "dialogue": null,
     "voice": 38,
     "verified": false,
-    "evidence": "已知战斗槽区不连续，中间交织其他角色；未确认独占对话库。禁止完整库注入。",
-    "partial": true
+    "partial": true,
+    "evidence": "已知战斗槽区不连续，中间交织其他角色；未确认独占对话库。禁止完整库注入。"
   },
   "孙策": {
     "battle": [
@@ -38,7 +38,7 @@
       3581
     ],
     "voice": 19,
-    "verified": true,
+    "verified": false,
     "evidence": "历史参考：战斗区 32 槽、对话区 72 槽；对话左界含一个短应答。当前安装须复核两侧归属。"
   }
 }
