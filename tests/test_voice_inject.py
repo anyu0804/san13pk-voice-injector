@@ -268,6 +268,36 @@ class VoiceTests(unittest.TestCase):
         self.assertIs(entry["verified"], True)
         self.assertEqual(entry["source_sha256"], V.bank_fingerprint(entry))
 
+    def test_reference_survives_repeated_locate_and_manual_confirmation(self):
+        self.bank["verified"] = False
+        self.save_bank()
+        with patch.object(V, "_scan", return_value={1: "伯符", 2: "伯符"}), patch.object(V, "_refine", return_value=(1, 1)):
+            first = V.cmd_locate("孙策")
+            self.assertEqual(first["reference"]["previous"]["dialogue"], [2, 2])
+            second = V.cmd_locate("孙策")
+            self.assertEqual(second["reference"], first["reference"])
+        V.cmd_confirm_bank("孙策", [1, 1], [2, 2])
+        confirmed = V.bankmap()["孙策"]
+        self.assertEqual(confirmed["reference"]["confirmed"]["dialogue"], [2, 2])
+        confirmed["verified"] = False
+        V.save_bankmap({"孙策": confirmed})
+        with patch.object(V, "_scan", return_value={1: "伯符", 2: "伯符"}), patch.object(V, "_refine", return_value=(1, 1)):
+            result = V.cmd_locate("孙策")
+        self.assertEqual(result["reference"], confirmed["reference"])
+
+    def test_shipped_reference_keeps_sunce_3510(self):
+        bank = json.loads((V.PROJECT_ROOT / "data/bank-map.json").read_text(encoding="utf-8"))
+        self.assertEqual(bank["孙策"]["reference"]["historical"]["dialogue"][0], 3510)
+        self.assertEqual(bank["袁绍"]["reference"]["historical"]["battle"], [1733, 1762])
+
+    def test_supported_traditional_officer_markers(self):
+        for traditional, simplified in [("董仲穎", "董仲颖"), ("大賢良師", "大贤良师"),
+                                        ("蒼天已死", "苍天已死"), ("貧道", "贫道"),
+                                        ("古之惡來", "古之恶来"), ("鳳雛", "凤雏"),
+                                        ("袁紹", "袁绍")]:
+            with self.subTest(traditional=traditional):
+                self.assertTrue(V._is_marker(traditional, [simplified]))
+
     def test_traditional_foreign_names_and_target_markers(self):
         self.assertTrue(V._is_foreign("趙雲在此", ["伯符"]))
         self.assertTrue(V._is_foreign("呂布在此", ["伯符"]))

@@ -272,7 +272,9 @@ TRADITIONAL = str.maketrans({"趙": "赵", "雲": "云", "呂": "吕", "諸": "�
                            "統": "统", "韋": "韦", "堅": "坚", "會": "会", "賈": "贾", "詡": "诩",
                            "擊": "击", "敗": "败", "敵": "敌", "將": "将", "虜": "虏", "報": "报",
                            "陣": "阵", "營": "营", "軍": "军", "國": "国", "辭": "辞", "傳": "传",
-                           "馬": "马", "黃": "黄", "維": "维", "貂": "貂", "蟬": "蝉", "遼": "辽"})
+                           "馬": "马", "黃": "黄", "維": "维", "貂": "貂", "蟬": "蝉", "遼": "辽",
+                           "穎": "颖", "賢": "贤", "師": "师", "蒼": "苍", "貧": "贫",
+                           "惡": "恶", "來": "来", "鳳": "凤", "雛": "雏", "紹": "绍"})
 
 
 def _is_marker(text, markers):
@@ -340,6 +342,9 @@ def cmd_locate(name):
              "verified": False,
              "evidence": f"候选战斗锚 {sorted(bat)}；候选对话锚 {sorted(dlg)}；边界归属待人工确认。",
              "located_at": time.strftime("%Y-%m-%d %H:%M")}
+    if name in m:
+        previous = m[name]
+        entry["reference"] = previous["reference"] if "reference" in previous else {"previous": previous}
     m[name] = entry
     save_bankmap(m)
     log(f"定位完成：战斗 {b_lo}-{b_hi}（{b_hi-b_lo+1} 槽），对话 {d_lo}-{d_hi}（{d_hi-d_lo+1} 槽）")
@@ -385,6 +390,10 @@ def cmd_confirm_bank(name, battle, dialogue):
     entry = {"battle": list(battle), "dialogue": list(dialogue), "voice": o["voice"],
              "verified": True, "evidence": "使用者已核对槽区、短应答簇及两侧归属。"}
     entry["source_sha256"] = bank_fingerprint(entry)
+    if name in m:
+        previous = m[name]
+        entry["reference"] = dict(previous["reference"]) if "reference" in previous else {"previous": previous}
+        entry["reference"]["confirmed"] = {k: v for k, v in entry.items() if k not in ("source_sha256", "reference")}
     m[name] = entry
     save_bankmap(m)
     log(f"已确认 {name} 的槽区（仅适用于当前帧表及音频内容）")
@@ -845,7 +854,7 @@ def cmd_list():
 
 def main():
     parser = argparse.ArgumentParser(description="San13PK 专属语音库替换工具（布局适用范围见 README）")
-    parser.add_argument("--version", action="version", version="%(prog)s 0.2.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.2.1")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("list", help="列出武将、定位状态和语音包")
     locate = sub.add_parser("locate", help="ASR 生成待人工确认的候选槽区")
