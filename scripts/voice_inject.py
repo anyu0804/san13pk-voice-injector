@@ -407,8 +407,6 @@ def _bucket_of(text, buckets, where, has_ext=False, markers=()):
         return "自报家门", 1
     if has_ext and "rules_ext" in buckets:
         g = buckets.get("grunt_ext", buckets["grunt"])
-        if len(t) <= g["max_text_len"]:
-            return g["bucket"], g["file"]
         l = buckets.get("laugh_ext", buckets["laugh"])
         for pat in l["patterns"]:
             if pat in t and len(t) <= 8:
@@ -416,18 +414,21 @@ def _bucket_of(text, buckets, where, has_ext=False, markers=()):
         for r in buckets["rules_ext"]:
             if any(p in t for p in r["patterns"]):
                 return r["bucket"], r["file"]
+        if len(t) <= g["max_text_len"] and t.strip("，,。.!！?？…") in g["patterns"]:
+            return g["bucket"], g["file"]
         fb = buckets.get("fallback_ext", buckets["fallback"])
         return "兜底", fb["battle" if where == "battle" else "dialogue"]
 
     rules = buckets["rules"]
-    if len(t) <= buckets["grunt"]["max_text_len"]:
-        return buckets["grunt"]["bucket"], buckets["grunt"]["file"]
     for pat in buckets["laugh"]["patterns"]:
         if pat in t and len(t) <= 8:
             return buckets["laugh"]["bucket"], buckets["laugh"]["file"]
     for r in rules:
         if any(p in t for p in r["patterns"]):
             return r["bucket"], r["file"]
+    g = buckets["grunt"]
+    if len(t) <= g["max_text_len"] and t.strip("，,。.!！?？…") in g["patterns"]:
+        return g["bucket"], g["file"]
     fb = buckets["fallback"]
     return "兜底", fb["battle" if where == "battle" else "dialogue"]
 
@@ -890,3 +891,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

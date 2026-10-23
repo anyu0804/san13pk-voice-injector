@@ -344,6 +344,25 @@ class VoiceTests(unittest.TestCase):
 
 
 class ProcessAndCodecTests(unittest.TestCase):
+    def test_short_dialogue_uses_semantics_before_grunts(self):
+        buckets = json.loads((V.DATA / 'buckets.json').read_text(encoding='utf-8'))
+        for text, expected in [('遵命', ('日常领命', 11)), ('明白', ('日常领命', 11)),
+                               ('多谢', ('日常致谢', 11)), ('我接受', ('兜底', 11))]:
+            with self.subTest(text=text):
+                self.assertEqual(V._bucket_of(text, buckets, 'dialogue', True), expected)
+        self.assertEqual(V._bucket_of('我接受', buckets, 'dialogue'), ('接受', 3))
+        self.assertEqual(V._bucket_of('多谢', buckets, 'dialogue'), ('接受', 3))
+
+    def test_grunts_laughter_and_battle_commands_keep_their_buckets(self):
+        buckets = json.loads((V.DATA / 'buckets.json').read_text(encoding='utf-8'))
+        for ext in (False, True):
+            for where in ('battle', 'dialogue'):
+                with self.subTest(ext=ext, where=where):
+                    self.assertEqual(V._bucket_of('哼！', buckets, where, ext), ('短喝', 10 if ext else 8))
+                    self.assertEqual(V._bucket_of('哈哈', buckets, where, ext), ('笑', 10 if ext else 2))
+        self.assertEqual(V._bucket_of('冲啊', buckets, 'battle', True), ('战场冲锋', 10))
+        self.assertEqual(V._bucket_of('冲啊', buckets, 'battle'), ('出征', 7))
+
     def test_japanese_low_memory_process_is_detected(self):
         result = SimpleNamespace(returncode=0, stdout='"San13PK_jp.exe","42","Console","1","1 K"\n', stderr="")
         with patch.object(V.subprocess, "run", return_value=result):
@@ -373,3 +392,4 @@ class ProcessAndCodecTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

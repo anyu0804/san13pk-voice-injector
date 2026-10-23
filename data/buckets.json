@@ -32,10 +32,11 @@
     {"bucket": "出仕", "file": 5, "patterns": ["主公", "出仕", "效劳", "扫清", "执子", "入局"]},
     {"bucket": "羁绊感叹", "file": 9, "patterns": ["荣耀", "并肩", "生死", "高台", "永别", "威名", "羁绊", "轰炉", "明灯", "同京"]}
   ],
-  "grunt": {"bucket": "短喝", "file": 8, "max_text_len": 3, "note": "识别文本≤3字的纯语气词（哈/嘿/哼/嗯/冲/呀）"},
-  "grunt_ext": {"bucket": "短喝", "file": 10, "max_text_len": 3, "note": "扩展包纯短喝（看招/休想/接招/破/可恶/怎么会/什么）"},
+  "grunt": {"bucket": "短喝", "file": 8, "max_text_len": 3, "patterns": ["哈", "嘿", "哼", "嗯", "冲", "呀"], "note": "先匹配语义规则，再按明确语气词识别短喝"},
+  "grunt_ext": {"bucket": "短喝", "file": 10, "max_text_len": 3, "patterns": ["哈", "嘿", "哼", "嗯", "冲", "呀", "看招", "休想", "接招", "破", "可恶", "怎么会", "什么"], "note": "先匹配语义规则，再按明确语气词识别短喝"},
   "laugh": {"bucket": "笑", "file": 2, "patterns": ["哈哈", "呵呵", "嘿嘿", "嗯嗯嗯", "哼哼"], "note": "纯笑声句"},
   "laugh_ext": {"bucket": "笑", "file": 10, "patterns": ["哈哈", "呵呵", "嘿嘿", "有意思"], "note": "扩展包笑声句"},
   "fallback": {"battle": 8, "dialogue": 6},
   "fallback_ext": {"battle": 10, "dialogue": 11}
 }
+
